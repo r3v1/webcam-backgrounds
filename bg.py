@@ -28,25 +28,9 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Realizar eliminación de fondo en un flujo de video"
     )
-    parser.add_argument("--video_source", default="/dev/video2", help="Fuente de video")
-    parser.add_argument("--background", default="fire.png", help="Imagen de fondo")
+    parser.add_argument("--video_source", default="/dev/video0", help="Fuente de video")
+    parser.add_argument("--background", default="monkey.png", help="Imagen de fondo")
     return parser.parse_args()
-
-
-def hist_match(source, template):
-    # Calculate histogram of source and template
-    source_hist, _ = np.histogram(source.ravel(), 256, [0, 256])
-    template_hist, _ = np.histogram(template.ravel(), 256, [0, 256])
-
-    # Normalize cumulative histogram
-    source_cumsum = np.cumsum(source_hist) / source.size
-    template_cumsum = np.cumsum(template_hist) / template.size
-
-    # Create a mapping to match histograms
-    hist_map = np.interp(source_cumsum, template_cumsum, np.arange(256))
-
-    # Apply mapping
-    return hist_map[source].reshape(source.shape).astype(np.uint8)
 
 
 def convertScale(img, alpha, beta):
@@ -126,13 +110,13 @@ def scale_points_around_origin(routes, scale):
     #     [0, 1, -routes[:, 1].min()],
     #     [0, 0, 1],
     # ])
-    
+
     # Matriz original con una dimensión extra
     X = np.concatenate([routes, np.ones((routes.shape[0], 1))], axis=1)
 
     # Debug
     # plt.clf(); plt.plot(routes[:, 0], routes[:, 1]); plt.grid(); plt.xlim([0, 640]); plt.ylim([480, 0])
-    
+
     # Concatenar transformaciones
     X_ = X @ C.T @ S.T @ np.linalg.inv(C.T)
     # Debug
@@ -141,7 +125,9 @@ def scale_points_around_origin(routes, scale):
     return np.round(X_[:, :2]).astype(int)
 
 
-def face_extractor(img, detector: FaceMeshDetector, routes_idx: list, scale: float = 1):
+def face_extractor(
+    img, detector: FaceMeshDetector, routes_idx: list, background=None, scale: float = 1
+):
     chroma = np.ones_like(img) * [[255, 0, 255]]
     scaled_img = cv2.resize(img, (0, 0), fx=scale, fy=scale)
     imgOut, faces = detector.findFaceMesh(scaled_img, draw=False)
@@ -164,7 +150,7 @@ def face_extractor(img, detector: FaceMeshDetector, routes_idx: list, scale: flo
             scale,
         )
         # plt.plot(scaled_image_bbox[:, 1], scaled_image_bbox[:, 0], "x")
-        
+
         # # Fill square with original image
         frame = np.ones_like(img) * [[255, 0, 255]]
         y0, x0 = scaled_image_bbox.min(axis=0)
@@ -176,11 +162,11 @@ def face_extractor(img, detector: FaceMeshDetector, routes_idx: list, scale: flo
         # plt.plot(scaled_routes[:, 0], scaled_routes[:, 1]);
 
         if y0 < 0:
-            scaled_img = scaled_img[-y0:-y0+img.shape[0]]
+            scaled_img = scaled_img[-y0 : -y0 + img.shape[0]]
             y0 = 0
             y1 = img.shape[0]
         if x0 < 0:
-            scaled_img = scaled_img[:, -x0:-x0+img.shape[1]]
+            scaled_img = scaled_img[:, -x0 : -x0 + img.shape[1]]
             x0 = 0
             x1 = img.shape[1]
         frame[y0:y1, x0:x1] = scaled_img
@@ -195,16 +181,69 @@ def face_extractor(img, detector: FaceMeshDetector, routes_idx: list, scale: flo
         mask = np.concatenate([mask, mask, mask], axis=2)
 
         imgOut = np.where(mask, frame, chroma)
+
+        # fig = plt.figure(figsize = (15, 15))
+        # plt.axis('off')
+        # plt.imshow(imgOut)
+
+        # -------------------------------------------------------------------------------------------- #
+        #                          POSICIONAR LA IMAGEN Y HACER UN WARP AFFINE                         #
+        # -------------------------------------------------------------------------------------------- #
+        # Imagen del gorila
+        X1, Y1 = 245, 136  # left upper eyebrow pixel
+        X2, Y2 = 318, 133  # right upper eyebrow pixel
+        X3, Y3 = 277, 245  # chin pixel
+        X4, Y4 = 244, 207
+
+        x1, y1 = face[21]  # left upper eyebrow pixel
+        x2, y2 = face[301]  # right upper eyebrow pixel
+        x3, y3 = face[152]  # chin pixel
+        x4, y4 = face[61]
+        # plt.plot([x1, x2, x3, x1], [y1, y2, y3, y1], "x")
+
+        # Calcular la matriz de transformación
+        pts1 = np.float32([[x1, y1], [x2, y2], [x3, y3]])
+        pts2 = np.float32([[X1, Y1], [X2, Y2], [X3, Y3]])
+
+        matrix = cv2.getAffineTransform(pts1, pts2)
+
+        # Convertir el chroma de imgOut a alpha
+        imgOut_alpha = cv2.cvtColor(np.float32(imgOut), cv2.COLOR_RGB2RGBA)
+        idx = (imgOut[:, :, 0] > 250) & (imgOut[:, :, 1] < 5) & (imgOut[:, :, 2] > 250)
+        imgOut_alpha[:, :, 3] = np.where(idx, 0, 255)
+        imgOut_alpha = np.uint8(imgOut_alpha)
+        # plt.imshow(imgOut_alpha)
+
+        # Aplicar la transformación
+        transformed_face = cv2.warpAffine(
+            imgOut_alpha, matrix, (chroma.shape[1], chroma.shape[0])
+        )
+        # plt.imshow(transformed_face)
+
+        # Mezclar las imágenes:
+        # final_image = cv2.addWeighted(background, 1, transformed_face, 1, 0)
+
+        # Add alpha channel to background
+        background_alpha = cv2.cvtColor(np.float32(background), cv2.COLOR_RGB2RGBA)
+        background_alpha[:, :, 3] = 255
+        background_alpha = np.uint8(background_alpha)
+
+        final_image = np.where(
+            transformed_face[:, :, [3]] == 0,
+            background_alpha[:, :, :3],
+            transformed_face[:, :, :3],
+        )
+        
+        # plt.clf()
+        # plt.imshow(final_image)
+        # plt.show()
+
+        # imgOut = np.float32(imgOut)
+
     else:
-        imgOut = chroma
+        final_image = background
 
-    # fig = plt.figure(figsize = (15, 15))
-    # plt.axis('off')
-    # plt.imshow(imgOut)
-
-    imgOut = np.float32(imgOut)
-
-    return imgOut
+    return final_image
 
 
 def main(video_source: str, background_file: str):
@@ -266,20 +305,20 @@ def main(video_source: str, background_file: str):
         # imgBG can be a color or an image as well. must be same size as the original if image
         # 'cutThreshold' is the sensitivity of the segmentation.
         # imgOut = segmentor.removeBG(img, imgBg=(255, 0, 255), cutThreshold=0.95)
+
+        # u_chroma = np.array([255, 0, 255])
+        # l_chroma = np.array([255, 0, 255])
+
+        # mask = cv2.inRange(imgOut, l_chroma, u_chroma)
+
+        # # Reemplazamos la máscara con la imagen de fondo
+        # f = automatic_brightness_and_contrast_based_on_background(
+        #     imgOut.copy(), background, influence=influence
+        # )
+        # # f = imgOut.copy()
+        # f[mask != 0] = background[mask != 0]
         # ---------------------------------------------------------------------------------------- #
-        imgOut = face_extractor(img, detector, routes_idx)
-
-        u_chroma = np.array([255, 0, 255])
-        l_chroma = np.array([255, 0, 255])
-
-        mask = cv2.inRange(imgOut, l_chroma, u_chroma)
-
-        # Reemplazamos la máscara con la imagen de fondo
-        f = automatic_brightness_and_contrast_based_on_background(
-            imgOut.copy(), background, influence=influence
-        )
-        # f = imgOut.copy()
-        f[mask != 0] = background[mask != 0]
+        f = face_extractor(img, detector, routes_idx, background)
 
         # Stack the original image and the image with background removed side by side
         # imgStacked = cvzone.stackImages([img, imgOut, f], cols=3, scale=1)
